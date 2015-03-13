@@ -223,3 +223,7 @@ FakesAssemblies/
 *.exe
 *.out
 *.app
+
+# Output images
+HNI_0007/
+HNI_0008/

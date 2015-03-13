@@ -1,245 +1,140 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <iomanip>
 #include <sstream>
+
 #include "utils.hh"
-
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/frame.h>
-#include <libavutil/imgutils.h>
-}
-
+#include "n3dsvideo.hh"
 #include <opencv2/opencv.hpp>
-
-
-AVFormatContext *fmtCtx = nullptr;
-int leftStreamIdx = 0;
-int rightStreamIdx = 0;
-std::string outputPath = "./";
-
-
-/**
-   Opens the file, and initializes the format context and left/right streams.
-   */
-void initializeStreams(const char *inputFilename) {
-
-	// Open the input file and determine the file format.
-
-	if (avformat_open_input(&fmtCtx, inputFilename, nullptr, nullptr) < 0) {
-		printf("Unable to open input video %s\n", inputFilename);
-		exit(1);
-	}
-	if (avformat_find_stream_info(fmtCtx, nullptr) < 0) {
-		printf("Video stream information is invalid - is the file corrupt?\n");
-		exit(1);
-	}
-
-	// Dump our format information to stderr, for debugging.
-	av_dump_format(fmtCtx, 0, inputFilename, 0);
-
-	// The Nintendo 3DS stores the left and right channels in two separate
-	// video streams. We need to find these streams, and initialize the
-	// left/rightStream variables accordingly.
-
-	int nStreams = 0;
-	int *curStreamIdx = &leftStreamIdx;
-
-	for (unsigned i = 0; i < fmtCtx->nb_streams; ++i) {
-		int stream = av_find_best_stream(
-			fmtCtx, AVMEDIA_TYPE_VIDEO, i, -1, nullptr, 0);
-		// If stream i isn't a video stream, or we can't decode it, then ignore it.
-		if (stream < 0)
-			continue;
-		// If we found too many streams, then just stop here.
-		if (nStreams >= 2) {
-			printf("Video contains more than 2 streams - ignoring the rest\n");
-			break;
-		}
-
-		++nStreams;
-		AVStream *curStream = fmtCtx->streams[stream];
-		*curStreamIdx = stream;
-
-		// Find a decoder for the stream and initialize it. After we do this,
-		// the stream will be ready for use.
-
-		AVCodecContext *decCtx = curStream->codec;
-		AVCodec *dec = avcodec_find_decoder(decCtx->codec_id);
-		AVDictionary *opts = nullptr; // unused
-
-		if (dec == nullptr) {
-			printf("Unable to find codec to decode video stream %d\n", i);
-			exit(1);
-		}
-		if (avcodec_open2(decCtx, dec, &opts) < 0) {
-			printf("Unable to open codec to decode video stream %d\n", i);
-			exit(1);
-		}
-
-		// Done - move to the next stream.
-		curStreamIdx = &rightStreamIdx;
-	}
-
-	// Sanity check - we want exactly two video streams ...
-	if (nStreams < 2) {
-		printf("Unable to find left/right video streams in the input\n");
-		exit(1);
-	}
-}
-
-
-/**
-   Decodes a portion of a single packet, using the given frame as a
-   temporary buffer. This returns the number of bytes read from the packet,
-   which for video should always be the entire packet.
-
-   If gotFrame is non-null, then that flag will be set if any frame of
-   a video stream is decoded. This is needed when we are flushing out
-   the input buffer, since some codecs may compress multiple frames in one
-   packet.
-*/
-int decodePacket(
-	AVPacket *packet, AVFrame *frame,
-	cv::Mat &destFrame, bool *gotFrame = nullptr)
-{
-	if (gotFrame) *gotFrame = false;
-	int gotFrameF;
-
-	if (packet->stream_index != leftStreamIdx &&
-		packet->stream_index != rightStreamIdx)
-		return packet->size; // Ignore the packet.
-
-	// Decode a frame from the packet.
-	AVCodecContext *decCtx = fmtCtx->streams[packet->stream_index]->codec;
-	int bytes = avcodec_decode_video2(decCtx, frame, &gotFrameF, packet);
-
-	// Check for errors.
-	if (bytes < 0) {
-		char buf[256];
-		av_strerror(bytes, buf, sizeof(buf));
-		printf("Error while decoding video frame: %s\n", buf);
-		return bytes;
-	}
-	if (!gotFrameF)
-		return packet->size;
-	/*
-	if (decCtx->width != destFrame->width() ||
-	decCtx->height != destFrame->height())
-	{
-	printf("Error while decoding video frame: the size of the video changed\n"
-	"  expected: %dx%d, got: %dx%d\n",
-	destFrame->width(), destFrame->height(),
-	decCtx->width, decCtx->height);
-	return packet->size;
-	}
-	*/
-
-	// Should have a valid video frame now. However, we need to ensure
-	// that it's in the format we expect (RGB). The image is likely
-	// in some version of YUV420 format, which will require some
-	// conversion.
-
-	if (decCtx->pix_fmt != AV_PIX_FMT_YUV420P &&
-		decCtx->pix_fmt != AV_PIX_FMT_YUVJ420P) // JPEG - any differences?
-	{
-		printf("Error while decoding video frame: unsupported pixel format\n"
-			"  expected: yuv420p, got: %s\n",
-			av_get_pix_fmt_name(decCtx->pix_fmt));
-		return packet->size;
-	}
-
-	convertYUV420ToRGB(frame, decCtx->width, decCtx->height, destFrame);
-
-	if (gotFrame) *gotFrame = true;
-	return packet->size;
-}
-
-
+#include <opencv2/calib3d.hpp>
 
 
 int main(int argc, char **argv) {
-
 	if (argc < 2) {
-		printf("No video file provided - exiting\n");
+		printf("no video file provided - exiting\n");
 		return 0;
 	}
-
-	av_register_all();
-
-	const std::string inputPath = argv[1];
-	initializeStreams(inputPath.c_str());
-
+	
 	// The output path is built from the input filename, minus the file
 	// extension.
 
-	outputPath = inputPath;
+	std::string inputPath = argv[1];
+	std::string outputPath = inputPath;
 	size_t lastSlash = outputPath.find_last_of("\\/");
 	if (lastSlash != std::string::npos)
 		outputPath = outputPath.substr(lastSlash + 1);
 	size_t lastDot = outputPath.rfind('.');
 	if (lastDot != std::string::npos)
 		outputPath = outputPath.substr(0, lastDot);
+	
+	try {
+		// Load the input video.
 
-	// Build our output directories.
+		N3DSVideo *video = new N3DSVideo(inputPath.c_str(), true);
+		makeDirectory(outputPath.c_str());
+		makeDirectory((outputPath + "/image").c_str());
+		makeDirectory((outputPath + "/right").c_str());
+		makeDirectory((outputPath + "/depth").c_str());
 
-	makeDirectory(outputPath.c_str());
-	makeDirectory((outputPath + "/image").c_str());
-	makeDirectory((outputPath + "/depth").c_str());
+		printf("Processing video ...\n");
 
-	// When we process the file, we read it in chunks, and then decode whatever
-	// frames of each stream we get. This means that the left and right streams
-	// may not be decoded in sync, so we need to keep unmatched images around
-	// until both are decoded.
+		cv::namedWindow("Diff", cv::WINDOW_AUTOSIZE);
+		cv::namedWindow("Disparity", cv::WINDOW_AUTOSIZE);
+		
+		auto stereoLoRes = cv::StereoBM::create();
+		auto stereoHiRes = cv::StereoBM::create();
 
-	AVFrame *tmpFrame = av_frame_alloc();
-	AVPacket packet; av_init_packet(&packet);
-	packet.data = nullptr;
-	packet.size = 0;
-	cv::Mat decFrame;
+		// These settings were infered through trial-and-error by using a simple tool 
+		// called StereoBMTunner, with sources available here: 
+		// http://blog.martinperis.com/2011/08/opencv-stereo-matching.html
+		
+		// The input images are NOISY - filter as much as we can.
+		stereoLoRes->setPreFilterType(stereoLoRes->PREFILTER_XSOBEL);
+		stereoLoRes->setPreFilterCap(63);
+		stereoHiRes->setPreFilterType(stereoHiRes->PREFILTER_XSOBEL);
+		stereoHiRes->setPreFilterCap(63);
+		// A larger matching block can get more information, but too large gives no 
+		// fine detail.
+		stereoLoRes->setBlockSize(21);
+		stereoHiRes->setBlockSize(9);
+		// The 3DS cameras are a fair distance apart, so push the images closer together.
+		// 48 seems good for objects that are at least 2ft from the cameras. If this is
+		// too large, then close objects won't be detected.
+		stereoLoRes->setMinDisparity(48);
+		stereoHiRes->setMinDisparity(48);
+		// A larger disparity range lets us handle deeper scenes, but will crop the depth
+		// map and reduce distance accuracy (since the map is stored as 8-bit values).
+		// 32 seems to be good for average size rooms.
+		stereoLoRes->setNumDisparities(32);
+		stereoHiRes->setNumDisparities(32);
+		// This filtering step removes erratic depth values (i.e. salt-and-pepper noise).
+		// It's better to remove too much than have inaccurate values ...
+		stereoLoRes->setTextureThreshold(3000);
+		stereoHiRes->setTextureThreshold(3000);
 
-	printf("Processing video ...\n");
+		int frame = 0;
+		int timeMs = 0;
 
-	//XXX
-	cv::namedWindow("Left", cv::WINDOW_AUTOSIZE);
-	cv::namedWindow("Right", cv::WINDOW_AUTOSIZE);
+		const int downsample = 2;
+		int dispMaxi = 1;
 
-	while (av_read_frame(fmtCtx, &packet) >= 0) {
-		AVPacket savedPacket = packet;
-		bool gotFrame = true;
-		do {
-			int bytesUsed = decodePacket(&packet, tmpFrame, decFrame, &gotFrame);
-			if (bytesUsed < 0)
-				break;
-			if (gotFrame) {
-				if (packet.stream_index == leftStreamIdx)
-					cv::imshow("Left", decFrame);
-				else
-					cv::imshow("Right", decFrame);
-				cv::waitKey(16);
-			}
-			packet.data += bytesUsed;
-			packet.size -= bytesUsed;
-		} while (packet.size > 0);
-		av_free_packet(&savedPacket);
+		while (video->processStep()) {
+			if (!video->hasNewStereoImage()) continue;
+
+			std::ostringstream colourFile;
+			std::ostringstream depthFile;
+			std::ostringstream rightFile;
+			colourFile << outputPath << "/image/" 
+				<< std::setw(6) << std::setfill('0') << frame << "-" 
+				<< std::setw(6) << std::setfill('0') << timeMs << ".jpg";
+			depthFile << outputPath << "/depth/"
+				<< std::setw(6) << std::setfill('0') << frame << "-"
+				<< std::setw(6) << std::setfill('0') << timeMs << ".png";
+			rightFile << outputPath << "/right/"
+				<< std::setw(6) << std::setfill('0') << frame << "-"
+				<< std::setw(6) << std::setfill('0') << timeMs << ".jpg";
+
+			frame++;
+			timeMs += 33;
+
+			cv::Mat disparityLoRes;
+			cv::Mat disparityHiRes;
+			stereoLoRes->compute(video->rightImage(), video->leftImage(), disparityLoRes);
+			stereoHiRes->compute(video->rightImage(), video->leftImage(), disparityHiRes);
+
+			// Merge the high-res and low-res disparity maps. We basically just prefer the
+			// high-res version unless we had no match at that pixel.
+			disparityHiRes = cv::max(disparityLoRes, disparityHiRes);
+			//disparityHiRes.convertTo(disparityHiRes, CV_16U);
+			
+			cv::imwrite(colourFile.str(), video->leftImage());
+			cv::imwrite(depthFile.str(), disparityHiRes);
+			cv::imwrite(rightFile.str(), video->rightImage());
+
+			// Since the depth image is likely to be very dark, rescale it before showing it.
+			double mini, maxi;
+			cv::minMaxIdx(disparityHiRes, &mini, &maxi);
+			//printf("%d %f %f %d\n", disparityHiRes.type(), mini, maxi, dispMaxi);
+			if (maxi > dispMaxi)
+				dispMaxi = maxi;
+			double scale = 255.0 / dispMaxi;
+			disparityHiRes.convertTo(disparityHiRes, CV_8UC1, scale, -mini*scale);
+			
+			cv::imshow("Diff", 0.5 * (video->rightImage() - video->leftImage()) + 127);
+			cv::imshow("Disparity", disparityHiRes);
+			cv::waitKey(33);
+		}
+
+		printf("... done.\n");
+		delete video;
 	}
-	// We may still have some frames cached, so flush them.
-	packet.data = nullptr;
-	packet.size = 0;
-	bool gotFrame = true;
-	while (gotFrame) {
-		decodePacket(&packet, tmpFrame, decFrame, &gotFrame);
+	catch (const std::exception& ex) {
+		printf("an error occured: %s\n", ex.what());
 	}
-
-	printf("Success.\n");
-
-	// Clean up.
-
-	avcodec_close(fmtCtx->streams[leftStreamIdx]->codec);
-	avcodec_close(fmtCtx->streams[rightStreamIdx]->codec);
-	avformat_close_input(&fmtCtx);
-	av_frame_free(&tmpFrame);
+	catch (...) {
+		printf("an unknown error occured");
+	}
 
 	return 0;
 }

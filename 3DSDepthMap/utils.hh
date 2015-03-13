@@ -18,5 +18,7 @@ void makeDirectory(const char *name);
 */
 void convertYUV420ToRGB(AVFrame *frame, int w, int h, cv::Mat &res);
 
+void convertYUV420ToY(AVFrame *frame, int w, int h, cv::Mat &res);
+
 
 #endif

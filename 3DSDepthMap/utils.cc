@@ -57,3 +57,28 @@ void convertYUV420ToRGB(AVFrame *frame, int w, int h, cv::Mat &res) {
 	// Finally, convert the YUV values to BGR.
 	cv::cvtColor(res, res, cv::COLOR_YCrCb2BGR);
 }
+
+
+void convertYUV420ToY(AVFrame *frame, int w, int h, cv::Mat &res) {
+	res.create(cv::Size(w, h), CV_8UC1);
+
+	const int w8 = w & ~7;
+	const uint8_t *ySrc = frame->data[0];
+
+	for (int i = 0; i < h; ++i) {
+		uint8_t *dest = res.ptr(i);
+		for (int j = 0; j < w8 / 8; ++j) {
+#define LOOP  	*(dest++) = *(ySrc++);
+			LOOP;
+			LOOP;
+			LOOP;
+			LOOP;
+			LOOP;
+			LOOP;
+			LOOP;
+			LOOP;
+#undef LOOP
+		}
+		ySrc += frame->linesize[0] - w8;
+	}
+}

@@ -12,9 +12,11 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cc" />
+    <ClCompile Include="n3dsvideo.cc" />
     <ClCompile Include="utils.cc" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="n3dsvideo.hh" />
     <ClInclude Include="utils.hh" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
@@ -66,7 +68,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>avcodec.lib;avformat.lib;avutil.lib;opencv_world300.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>avcodec.lib;avformat.lib;avutil.lib;opencv_world300d.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>xcopy /y /d "$(ProjectDir)\ffmpeg\bin\*.dll" "$(OutDir)"
