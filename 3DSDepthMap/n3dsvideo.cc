@@ -14,7 +14,7 @@ extern "C" {
 bool N3DSVideo::s_libavReady = false;
 
 
-N3DSVideo::N3DSVideo(const char *filename, bool wantGrayscale) {
+N3DSVideo::N3DSVideo(const char *filename, bool wantGrayscale, bool flipCameras) {
 	if (!s_libavReady) {
 		av_register_all();
 		s_libavReady = true;
@@ -39,8 +39,9 @@ N3DSVideo::N3DSVideo(const char *filename, bool wantGrayscale) {
 	// video streams. We need to find these streams, and initialize the
 	// left/rightStream variables accordingly.
 
+	int leftIdx, rightIdx;
 	int nStreams = 0;
-	int *curStreamIdx = &m_leftStreamIdx;
+	int *curStreamIdx = &leftIdx;
 
 	for (unsigned i = 0; i < m_fmtCtx->nb_streams; ++i) {
 		int stream = av_find_best_stream(
@@ -80,12 +81,21 @@ N3DSVideo::N3DSVideo(const char *filename, bool wantGrayscale) {
 			CV_Error_(cv::Error::StsUnsupportedFormat, ("cannot decode stream ", i));
 
 		// Done - move to the next stream.
-		curStreamIdx = &m_rightStreamIdx;
+		curStreamIdx = &rightIdx;
 	}
 
 	// Sanity check - we want exactly two video streams.
 	if (nStreams < 2)
 		CV_Error(cv::Error::StsBadArg, "cannot find matching L/R video streams");
+
+	if (flipCameras) {
+		m_leftStreamIdx = rightIdx;
+		m_rightStreamIdx = leftIdx;
+	}
+	else {
+		m_leftStreamIdx = leftIdx;
+		m_rightStreamIdx = rightIdx;
+	}
 
 	m_tmpFrame = av_frame_alloc();
 	m_packet = new AVPacket;

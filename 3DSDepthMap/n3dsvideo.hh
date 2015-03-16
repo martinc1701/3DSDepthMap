@@ -17,7 +17,7 @@ public:
 		something went wrong (the file doesn't exist, wrong file format,
 		etc), a cv::Exception instance will be thrown describing the error.
 	*/
-	N3DSVideo(const char *filename, bool wantGrayscale);
+	N3DSVideo(const char *filename, bool wantGrayscale, bool flipCameras);
 	~N3DSVideo();
 
 	/**
