@@ -1,3 +1,31 @@
+/**
+	3DS Depth Map generation.
+
+	Currently, this takes a single argument (the .AVI video file recorded by the 3DS)
+	and converts it into a sequence of images stored in a folder with the same name as
+	the file. There are two sets of images: the view from the left camera, and the
+	depth (disparity) map corresponding to it.
+
+	We assume that "no information" is better than "false information"; thus, we
+	rigorously filter the results until we have something satisfactory, although it
+	may not have much actual depth information. This is something that needs to be
+	experimented with.
+
+	The current algorithm is as follows. We first generate the depth map using OpenCV's
+	StereoBM (block matcher) algorithm, configured to perform both pre- and post-
+	filtering to remove noise. This works well (especially if the block size is 
+	reasonably large), but suffers from "ballooning" - depth values for a foreground
+	object tend to be duplicated around the silouette of the object as well.
+	
+	To remedy this, we use the following intuition: any significant change in depth
+	should occur on the edge of an object. We apply this idea by running an edge 
+	detection pass on both the depth and colour images, and then for each pixel row
+	of the depth image, if we find a depth-edge, then we fill the depth image to the
+	left/right of this edge with the "unknown" depth value until we come across a
+	colour edge. Since there is inevitably noise edges, we apply a median filter to
+	the result to remove any thin lines that were left behind.
+*/
+
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -10,79 +38,104 @@
 #include <opencv2/calib3d.hpp>
 
 
-// The type of matrix returned by StereoBM::compute(). I believe this is correct ...
-#define DEPTH_MAP_TYPE short
+//
+// Hard-coded constants (for now ...)
+//
 
-/**
-	To try and preserve as much detail as possible, we run the block matching algorithm
-	several times with different block sizes. Smaller block sizes can capture fine edge
-	details, but fail miserably on low-texture surfaces. Larger block sizes tend to
-	handle low-texture surfaces better but have poor resolution. The approach we take
-	here is to combine them - i.e. take the result from the smallest block size as long
-	as it gives us some information. With sufficient filtering, this should work well.
-*/
-static const int MAX_MATCHERS = 1;
-static const int MATCHER_BLOCK_SIZES[MAX_MATCHERS] = {
-	// MUST be odd, and sorted from smallest to largest
-	//9,
-	//21,
-	33,
-};
+// Block size for matching. Larger is slower, and tends to be less accurate, but
+// can find matches on less textured surfaces. MUST be odd.
+static const int MATCHER_BLOCK_SIZE = 21; 
 
-static cv::Ptr<cv::StereoBM> matchers[MAX_MATCHERS];
+// Edge detection thresholds for "deflating" the depth values. We want the colour
+// threshold to be low, and the depth threshold to be high.
+static const int COLOUR_EDGE_THRESHOLD = 5;
+static const int DEPTH_EDGE_THRESHOLD = 150;
 
-static void initMatchers() {
-	for (int i = 0; i < MAX_MATCHERS; ++i) {
-		matchers[i] = cv::StereoBM::create();
 
-		// These settings were infered through trial-and-error by using a simple tool 
-		// called StereoBMTunner, with sources available here: 
-		// http://blog.martinperis.com/2011/08/opencv-stereo-matching.html
+static cv::Ptr<cv::StereoBM> matcher;
 
-		// The input images are NOISY - filter as much as we can.
-		matchers[i]->setPreFilterType(cv::StereoBM::PREFILTER_XSOBEL);
-		matchers[i]->setPreFilterCap(63);
-		// A larger matching block can get more information, but too large gives no 
-		// fine detail.
-		matchers[i]->setBlockSize(MATCHER_BLOCK_SIZES[i]);
-		// The 3DS cameras are a fair distance apart, so push the images closer together.
-		// 48 seems good for objects that are at least 2ft from the cameras. If this is
-		// too large, then close objects won't be detected.
-		matchers[i]->setMinDisparity(48);
-		// A larger disparity range lets us handle deeper scenes, but really crops the
-		// edges of the depth image.
-		matchers[i]->setNumDisparities(32);
-		// This filtering step removes erratic depth values (i.e. salt-and-pepper noise).
-		// It's better to remove too much than have inaccurate values ...
-		matchers[i]->setTextureThreshold(3000);
-	}
+static void initMatcher() {
+	matcher = cv::StereoBM::create();
+
+	// These settings were infered through trial-and-error by using a simple tool 
+	// called StereoBMTunner, with sources available here: 
+	// http://blog.martinperis.com/2011/08/opencv-stereo-matching.html
+	
+	// The input images are NOISY - filter as much as we can.
+	matcher->setPreFilterType(cv::StereoBM::PREFILTER_XSOBEL);
+	matcher->setPreFilterCap(63);
+	// A larger matching block can get more information, but too large gives no 
+	// fine detail.
+	matcher->setBlockSize(MATCHER_BLOCK_SIZE);
+	// The 3DS cameras are a fair distance apart, so push the images closer together.
+	// 48 seems good for objects that are at least 2ft from the cameras. If this is
+	// too large, then close objects won't be detected.
+	matcher->setMinDisparity(45);
+	// A larger disparity range lets us handle deeper scenes, but really crops the
+	// edges of the depth image.
+	matcher->setNumDisparities(32);
+	// This filtering step removes erratic depth values (i.e. salt-and-pepper noise).
+	// It's better to remove too much than have inaccurate values ...
+	matcher->setTextureThreshold(3000);
 }
+
 
 static cv::Mat computeDisparity(const cv::Mat& left, const cv::Mat& right) {
 	cv::Mat disparity, tmp;
 
-	matchers[0]->compute(left, right, disparity);
+	matcher->compute(left, right, disparity);
+	// For whatever reason, compute() gives us signed values ... likely a bug ...
+	disparity.convertTo(disparity, CV_16UC1);
 
-	// The minimum value corresponds to the "UNKNOWN" measurement. We need to know
-	// this for merging, since we assume that each matcher uses a progressively
-	// larger block size. We merge disparity values only if the current value for
-	// the pixel is UNKNOWN.
+	//
+	// Deal with the "ballooning" effect.
+	//
 
-	double dispUnknown;
-	cv::minMaxIdx(disparity, &dispUnknown);
+	// The minimum value corresponds to the "UNKNOWN" measurement.
+	double dispUnknown, dispMaxi;
+	cv::minMaxIdx(disparity, &dispUnknown, &dispMaxi);
 
-	for (int i = 1; i < MAX_MATCHERS; ++i) {
-		matchers[i]->compute(left, right, tmp);
-		double tmpUnknown;
-		cv::minMaxIdx(tmp, &tmpUnknown);
+	cv::Mat colourEdges, disparityEdges;
 
-		// Merge.
-		auto itSrc = tmp.begin<DEPTH_MAP_TYPE>();
-		auto itDisp = disparity.begin<DEPTH_MAP_TYPE>();
-		for ( ; itSrc != tmp.end<DEPTH_MAP_TYPE>(); ++itSrc, ++itDisp)
-			if (*itDisp == dispUnknown && *itSrc != tmpUnknown)
-				*itDisp = *itSrc;
+	// For the colour edges, blur first to remove noise.
+	cv::blur(left, tmp, cv::Size(7,7));
+	cv::Canny(tmp, colourEdges, COLOUR_EDGE_THRESHOLD, 3 * COLOUR_EDGE_THRESHOLD);
+
+	// For the disparity edges, rescale to 8-bit range, and use a slight blur.
+	double scale = 255.0 / (dispMaxi - dispUnknown + 1);
+	disparity.convertTo(tmp, CV_8U, scale, -dispUnknown * scale);
+	cv::blur(tmp, tmp, cv::Size(3, 3));
+	cv::Canny(tmp, disparityEdges, DEPTH_EDGE_THRESHOLD, 3 * DEPTH_EDGE_THRESHOLD);
+
+	//cv::imshow("colourEdges", colourEdges);
+	//cv::imshow("disparityEdges", disparityEdges);
+
+	// Search for depth edges and force them to coincide with colour edges.
+	for (int i = 0; i < colourEdges.rows; ++i) {
+		auto *cEdgeRow = colourEdges.ptr<uchar>(i);
+		auto *dEdgeRow = disparityEdges.ptr<uchar>(i);
+		auto *dst = disparity.ptr<ushort>(i);
+		
+		bool onEdge = false;
+		for (int j = 0; j < colourEdges.cols; ++j) {
+			if (!onEdge && dEdgeRow[j] > 0) {
+				if (cEdgeRow[j] == 0)
+					dst[j] = dispUnknown;
+				for (int k = j - 1; k >= 0 && dEdgeRow[k] == 0 && cEdgeRow[k] == 0; --k)
+					dst[k] = dispUnknown;
+				onEdge = true;
+			}
+			else if (onEdge && dEdgeRow[j] == 0) {
+				for (int k = j; k < colourEdges.cols && dEdgeRow[k] == 0 && cEdgeRow[k] == 0; ++k)
+					dst[k] = dispUnknown;
+				onEdge = false;
+			}
+		}
 	}
+
+	// Since we only do the above loop in 1 dimension, we may have thin lines due to noise.
+	// Remove these with a median filter (we do NOT want averages here ...)
+	cv::medianBlur(disparity, disparity, 5);
 
 	return disparity;
 }
@@ -112,7 +165,7 @@ int main(int argc, char **argv) {
 		N3DSVideo *video = new N3DSVideo(inputPath.c_str(), true, true);
 		makeDirectory(outputPath.c_str());
 		makeDirectory((outputPath + "/image").c_str());
-		makeDirectory((outputPath + "/right").c_str());
+		//makeDirectory((outputPath + "/right").c_str());
 		makeDirectory((outputPath + "/depth").c_str());
 
 		printf("Processing video ...\n");
@@ -121,7 +174,7 @@ int main(int argc, char **argv) {
 		cv::namedWindow("Disparity", cv::WINDOW_AUTOSIZE);
 		cv::namedWindow("Combined", cv::WINDOW_AUTOSIZE);
 		
-		initMatchers();
+		initMatcher();
 
 		int frame = 0;
 		int timeMs = 0;
@@ -132,16 +185,16 @@ int main(int argc, char **argv) {
 
 			std::ostringstream colourFile;
 			std::ostringstream depthFile;
-			std::ostringstream rightFile;
+			//std::ostringstream rightFile;
 			colourFile << outputPath << "/image/" 
 				<< std::setw(6) << std::setfill('0') << frame << "-" 
 				<< std::setw(6) << std::setfill('0') << timeMs << ".jpg";
 			depthFile << outputPath << "/depth/"
 				<< std::setw(6) << std::setfill('0') << frame << "-"
-				<< std::setw(6) << std::setfill('0') << timeMs << ".pgm";
-			rightFile << outputPath << "/right/"
-				<< std::setw(6) << std::setfill('0') << frame << "-"
-				<< std::setw(6) << std::setfill('0') << timeMs << ".jpg";
+				<< std::setw(6) << std::setfill('0') << timeMs << ".png";
+			//rightFile << outputPath << "/right/"
+			//	<< std::setw(6) << std::setfill('0') << frame << "-"
+			//	<< std::setw(6) << std::setfill('0') << timeMs << ".jpg";
 
 			frame++;
 			timeMs += 33;
@@ -150,22 +203,31 @@ int main(int argc, char **argv) {
 			
 			cv::imwrite(colourFile.str(), video->leftImage());
 			cv::imwrite(depthFile.str(), disparity);
-			cv::imwrite(rightFile.str(), video->rightImage());
+			//cv::imwrite(rightFile.str(), video->rightImage());
 
 			// Since the depth image is likely to be very dark, rescale it before showing it.
 			double mini, maxi;
 			cv::minMaxIdx(disparity, &mini, &maxi);
-			//printf("%d %f %f %d\n", disparityHiRes.type(), mini, maxi, dispMaxi);
 			if (maxi > dispMaxi)
 				dispMaxi = maxi;
 			double scale = 255.0 / dispMaxi;
 			disparity.convertTo(disparity, CV_8UC1, scale, -mini*scale);
+
+			if (frame == 1) {
+				printf("Min disparity   = %d\n"
+					   "Num disparities = %d\n"
+					   "Min pixel value = %f\n"
+					   "Divide pixel values by 16 to get the disparity. < 1 is no match/unknown.\n",
+					   matcher->getMinDisparity(), matcher->getNumDisparities(), mini);
+			}
 			
 			cv::imshow("Diff", 0.5 * (video->rightImage() - video->leftImage()) + 127);
-			cv::imshow("Disparity", disparity);
-
+			
 			cv::Mat colouredDisparity;
-			cv::applyColorMap(disparity, colouredDisparity, cv::COLORMAP_HOT);
+			cv::applyColorMap(disparity, colouredDisparity, cv::COLORMAP_JET);
+
+			cv::imshow("Disparity", colouredDisparity);
+
 			cv::Mat left;
 			cv::cvtColor(video->leftImage(), left, cv::COLOR_GRAY2BGR);
 
