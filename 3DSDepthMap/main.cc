@@ -46,6 +46,18 @@
 // can find matches on less textured surfaces. MUST be odd.
 static const int MATCHER_BLOCK_SIZE = 21; 
 
+// The 3DS cameras are a fair distance apart, so we need a suitable minimum distance
+// for the block matching. 48 seems good for objects that are at least 2ft from the
+// cameras. If this is too large, then close objects won't be detected; too small and
+// far objects won't be detected.
+static const int MIN_DISPARITY = 45;
+
+// By default the block matching uses a 12:4 fixed point format for disparity
+// measurements. However, because our images are so small (480x240), a maximum
+// disparity value still appears almost black in the output. We can change the
+// scale of the disparity here.
+static const int FRAC_MULTIPLIER = 16;
+
 // Edge detection thresholds for "deflating" the depth values. We want the colour
 // threshold to be low, and the depth threshold to be high.
 static const int COLOUR_EDGE_THRESHOLD = 5;
@@ -64,13 +76,10 @@ static void initMatcher() {
 	// The input images are NOISY - filter as much as we can.
 	matcher->setPreFilterType(cv::StereoBM::PREFILTER_XSOBEL);
 	matcher->setPreFilterCap(63);
-	// A larger matching block can get more information, but too large gives no 
-	// fine detail.
+	
 	matcher->setBlockSize(MATCHER_BLOCK_SIZE);
-	// The 3DS cameras are a fair distance apart, so push the images closer together.
-	// 48 seems good for objects that are at least 2ft from the cameras. If this is
-	// too large, then close objects won't be detected.
-	matcher->setMinDisparity(45);
+	matcher->setMinDisparity(MIN_DISPARITY);
+
 	// A larger disparity range lets us handle deeper scenes, but really crops the
 	// edges of the depth image.
 	matcher->setNumDisparities(32);
@@ -136,6 +145,12 @@ static cv::Mat computeDisparity(const cv::Mat& left, const cv::Mat& right) {
 	// Since we only do the above loop in 1 dimension, we may have thin lines due to noise.
 	// Remove these with a median filter (we do NOT want averages here ...)
 	cv::medianBlur(disparity, disparity, 5);
+
+	// Rescale the results. Since our video is only 480x240, we can have a disparity of at most
+	// 240, so we can scale things up to make them visible. By default, we only use 4 bits for
+	// fractional disparity.
+
+	disparity *= FRAC_MULTIPLIER;
 
 	return disparity;
 }
@@ -217,8 +232,9 @@ int main(int argc, char **argv) {
 				printf("Min disparity   = %d\n"
 					   "Num disparities = %d\n"
 					   "Min pixel value = %f\n"
-					   "Divide pixel values by 16 to get the disparity. < 1 is no match/unknown.\n",
-					   matcher->getMinDisparity(), matcher->getNumDisparities(), mini);
+					   "Divide pixel values by %d to get the disparity. < 1 is no match/unknown.\n",
+					   matcher->getMinDisparity(), matcher->getNumDisparities(), mini,
+					   16 * FRAC_MULTIPLIER);
 			}
 			
 			cv::imshow("Diff", 0.5 * (video->rightImage() - video->leftImage()) + 127);
