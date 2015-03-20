@@ -31,6 +31,7 @@
 #include <string>
 #include <iomanip>
 #include <sstream>
+#include <fstream>
 
 #include "utils.hh"
 #include "n3dsvideo.hh"
@@ -52,16 +53,21 @@ static const int MATCHER_BLOCK_SIZE = 21;
 // far objects won't be detected.
 static const int MIN_DISPARITY = 45;
 
-// By default the block matching uses a 12:4 fixed point format for disparity
-// measurements. However, because our images are so small (480x240), a maximum
-// disparity value still appears almost black in the output. We can change the
-// scale of the disparity here.
-static const int FRAC_MULTIPLIER = 16;
-
 // Edge detection thresholds for "deflating" the depth values. We want the colour
 // threshold to be low, and the depth threshold to be high.
 static const int COLOUR_EDGE_THRESHOLD = 5;
 static const int DEPTH_EDGE_THRESHOLD = 150;
+
+// The distance between the cameras, in metres
+static const double N3DSXL_CAM_DIST = 0.035;
+
+// The camera focal length, in pixels
+static const double N3DSXL_FOCAL_LEN = 565.0;
+
+// The 3DS cameras aren't perfectly aligned; the centre rays seem to converge at a
+// point ~25cm in front of the cameras. We can still approximate the depth in this
+// case. This value is in metres.
+static const double N3DSXL_CONVERGENCE = 0.25;
 
 
 static cv::Ptr<cv::StereoBM> matcher;
@@ -89,7 +95,7 @@ static void initMatcher() {
 }
 
 
-static cv::Mat computeDisparity(const cv::Mat& left, const cv::Mat& right) {
+static cv::Mat computeDepth(const cv::Mat& left, const cv::Mat& right) {
 	cv::Mat disparity, tmp;
 
 	matcher->compute(left, right, disparity);
@@ -119,7 +125,7 @@ static cv::Mat computeDisparity(const cv::Mat& left, const cv::Mat& right) {
 	//cv::imshow("colourEdges", colourEdges);
 	//cv::imshow("disparityEdges", disparityEdges);
 
-	// Search for depth edges and force them to coincide with colour edges.
+	// Search for disparity edges and force them to coincide with colour edges.
 	for (int i = 0; i < colourEdges.rows; ++i) {
 		auto *cEdgeRow = colourEdges.ptr<uchar>(i);
 		auto *dEdgeRow = disparityEdges.ptr<uchar>(i);
@@ -146,26 +152,80 @@ static cv::Mat computeDisparity(const cv::Mat& left, const cv::Mat& right) {
 	// Remove these with a median filter (we do NOT want averages here ...)
 	cv::medianBlur(disparity, disparity, 5);
 
-	// Rescale the results. Since our video is only 480x240, we can have a disparity of at most
-	// 240, so we can scale things up to make them visible. By default, we only use 4 bits for
-	// fractional disparity.
-
-	disparity *= FRAC_MULTIPLIER;
+	// Convert the disparity to a Kinect-style depth image. That is, we compute the depth to mm
+	// precision, then convert to some strange fixed-point format (reference: SiftFu.m:383).
+	for (int i = 0; i < disparity.rows; ++i) {
+		auto *row = disparity.ptr<ushort>(i);
+		for (int j = 0; j < disparity.cols; ++j) {
+			if (row[j] == dispUnknown)
+				row[j] = 0;
+			else {
+				// The disparity values are in 12:4 fixed point format, so be careful ...
+				double disp = (double)row[j] / 16.0;
+				double depth = 1000.0 * abs(
+					N3DSXL_CAM_DIST / ((N3DSXL_CAM_DIST / N3DSXL_CONVERGENCE) - (disp / N3DSXL_FOCAL_LEN)));
+				//printf("%f\n", depth);
+				ushort d = depth;
+				row[j] = (d << 3) | (d >> 13); //???
+			}
+		}
+	}
 
 	return disparity;
 }
 
 
-int main(int argc, char **argv) {
-	if (argc < 2) {
-		printf("no video file provided - exiting\n");
-		return 0;
+
+static bool quiet = false;
+static bool saveRaw = false;
+static bool noDepth = false;
+static std::string inputPath = "";
+
+static bool parseArgs(int argc, char **argv) {
+	for (int i = 1; i < argc; ++i) {
+		if (_stricmp(argv[i], "--quiet") == 0)
+			quiet = true;
+		else if (_stricmp(argv[i], "--saveRaw") == 0)
+			saveRaw = true;
+		else if (_stricmp(argv[i], "--noDepth") == 0)
+			noDepth = true;
+		else if (argv[i][0] == '-') {
+			if (_stricmp(argv[i], "--help") != 0)
+				printf("Unknown option '%s'\n", argv[i]);
+			printf("Valid arguments: [--quiet] [--saveRaw] [--noDepth] [--help] FILENAME.AVI\n\n"
+				   "Synopsis:\n"
+				   "  This program converts a video recorded by the Nintendo 3DS video app to depth\n"
+				   "  images for 3D reconstruction applications. The quality of the depth images is\n"
+				   "  directly related to how much detail is present in the images; if insufficient\n"
+				   "  detail is present, the reconstructed depth will have a large number of unknown\n"
+				   "  areas in it.\n\n"
+				   "Options:\n"
+				   "  --quiet           Don't display processed images as they are computed\n"
+				   "  --saveRaw         Save the left/right camera images\n"
+				   "  --noDepth         Don't compute depth maps\n"
+				   "  --help            Show this help text\n");
+			return false;
+		}
+		else
+			inputPath = argv[i];
 	}
+
+	if (inputPath == "") {
+		printf("No video file provided\n");
+		return false;
+	}
+
+	return true;
+}
+
+
+int main(int argc, char **argv) {
+	if (!parseArgs(argc, argv))
+		return 0;
 	
 	// The output path is built from the input filename, minus the file
 	// extension.
 
-	std::string inputPath = argv[1];
 	std::string outputPath = inputPath;
 	size_t lastSlash = outputPath.find_last_of("\\/");
 	if (lastSlash != std::string::npos)
@@ -179,77 +239,93 @@ int main(int argc, char **argv) {
 
 		N3DSVideo *video = new N3DSVideo(inputPath.c_str(), true, true);
 		makeDirectory(outputPath.c_str());
+		makeDirectory((outputPath + "/raw").c_str());
 		makeDirectory((outputPath + "/image").c_str());
-		//makeDirectory((outputPath + "/right").c_str());
 		makeDirectory((outputPath + "/depth").c_str());
 
-		printf("Processing video ...\n");
+		std::ofstream intrinsics(outputPath + "/intrinsics.txt");
+		intrinsics << N3DSXL_FOCAL_LEN << " 0 320\n0 " << N3DSXL_FOCAL_LEN << " 240\n0 0 1\n";
+		intrinsics.close();
 
-		cv::namedWindow("Diff", cv::WINDOW_AUTOSIZE);
-		cv::namedWindow("Disparity", cv::WINDOW_AUTOSIZE);
-		cv::namedWindow("Combined", cv::WINDOW_AUTOSIZE);
+		printf("Processing video ...\n");
+		
+		if (!quiet) {
+			cv::namedWindow("Diff", cv::WINDOW_AUTOSIZE);
+			cv::namedWindow("Disparity", cv::WINDOW_AUTOSIZE);
+			cv::namedWindow("Combined", cv::WINDOW_AUTOSIZE);
+		}
 		
 		initMatcher();
 
 		int frame = 0;
 		int timeMs = 0;
-		int dispMaxi = 1;
+		int dMaxi = 1;
 
 		while (video->processStep()) {
 			if (!video->hasNewStereoImage()) continue;
 
+			std::ostringstream filename;
+			filename << std::setw(6) << std::setfill('0') << frame << "-"
+				<< std::setw(6) << std::setfill('0') << timeMs;
+
 			std::ostringstream colourFile;
 			std::ostringstream depthFile;
-			//std::ostringstream rightFile;
-			colourFile << outputPath << "/image/" 
-				<< std::setw(6) << std::setfill('0') << frame << "-" 
-				<< std::setw(6) << std::setfill('0') << timeMs << ".jpg";
-			depthFile << outputPath << "/depth/"
-				<< std::setw(6) << std::setfill('0') << frame << "-"
-				<< std::setw(6) << std::setfill('0') << timeMs << ".png";
-			//rightFile << outputPath << "/right/"
-			//	<< std::setw(6) << std::setfill('0') << frame << "-"
-			//	<< std::setw(6) << std::setfill('0') << timeMs << ".jpg";
+			std::ostringstream rawLFile, rawRFile;
+			colourFile << outputPath << "/image/" << filename.str() << ".jpg";
+			depthFile << outputPath << "/depth/" << filename.str() << ".png";
+			rawLFile << outputPath << "/raw/" << filename.str() << "L.jpg";
+			rawRFile << outputPath << "/raw/" << filename.str() << "R.jpg";
 
 			frame++;
-			timeMs += 33;
+			timeMs += 50; // 3DS video is 20fps
 
-			cv::Mat disparity = computeDisparity(video->leftImage(), video->rightImage());
-			
-			cv::imwrite(colourFile.str(), video->leftImage());
-			cv::imwrite(depthFile.str(), disparity);
-			//cv::imwrite(rightFile.str(), video->rightImage());
-
-			// Since the depth image is likely to be very dark, rescale it before showing it.
-			double mini, maxi;
-			cv::minMaxIdx(disparity, &mini, &maxi);
-			if (maxi > dispMaxi)
-				dispMaxi = maxi;
-			double scale = 255.0 / dispMaxi;
-			disparity.convertTo(disparity, CV_8UC1, scale, -mini*scale);
-
-			if (frame == 1) {
-				printf("Min disparity   = %d\n"
-					   "Num disparities = %d\n"
-					   "Min pixel value = %f\n"
-					   "Divide pixel values by %d to get the disparity. < 1 is no match/unknown.\n",
-					   matcher->getMinDisparity(), matcher->getNumDisparities(), mini,
-					   16 * FRAC_MULTIPLIER);
+			if (saveRaw) {
+				cv::imwrite(rawLFile.str(), video->leftImage());
+				cv::imwrite(rawRFile.str(), video->rightImage());
 			}
+
+			if (noDepth) continue;
 			
-			cv::imshow("Diff", 0.5 * (video->rightImage() - video->leftImage()) + 127);
+			cv::Mat depth = computeDepth(video->leftImage(), video->rightImage());
 			
-			cv::Mat colouredDisparity;
-			cv::applyColorMap(disparity, colouredDisparity, cv::COLORMAP_JET);
+			// Write the two images - left camera and depth. However, for testing we want
+			// the output here to look like it came from the Kinect - that means we need to
+			// crop/rescale the images to 640x480.
 
-			cv::imshow("Disparity", colouredDisparity);
+			double imScale = 480.0 / depth.rows;
 
-			cv::Mat left;
-			cv::cvtColor(video->leftImage(), left, cv::COLOR_GRAY2BGR);
+			cv::Rect region(depth.cols/2 - 320.0 / imScale, 0, 
+							640.0 / imScale, depth.rows);
+			cv::Mat rescaledDepth, rescaledLeft;
+			cv::resize(depth(region), rescaledDepth, cv::Size(640, 480));
+			cv::resize(video->leftImage()(region), rescaledLeft, cv::Size(640, 480));
+			
+			cv::imwrite(colourFile.str(), rescaledLeft);
+			cv::imwrite(depthFile.str(), rescaledDepth);
 
-			cv::imshow("Combined", left + colouredDisparity);
+			if (!quiet) {
+				// Since the depth image is likely to be very dark, rescale it before showing it.
+				double mini, maxi;
+				cv::minMaxIdx(depth, &mini, &maxi);
+				if (maxi > dMaxi)
+					dMaxi = maxi;
+				double scale = 255.0 / dMaxi;
+				depth.convertTo(depth, CV_8UC1, scale);
 
-			cv::waitKey(33);
+				cv::imshow("Diff", 0.5 * (video->rightImage() - video->leftImage()) + 127);
+
+				cv::Mat colouredDepth;
+				cv::applyColorMap(depth, colouredDepth, cv::COLORMAP_JET);
+
+				cv::imshow("Disparity", colouredDepth);
+
+				cv::Mat left;
+				cv::cvtColor(video->leftImage(), left, cv::COLOR_GRAY2BGR);
+
+				cv::imshow("Combined", left + colouredDepth);
+
+				cv::waitKey(33);
+			}
 		}
 
 		printf("... done.\n");
