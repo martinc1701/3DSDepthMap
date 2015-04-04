@@ -32,11 +32,11 @@ void convertYUV420ToRGB(AVFrame *frame, int w, int h, cv::Mat &res) {
 		uint8_t *dest = res.ptr(i);
 		for (int j = 0; j < w8 / 8; ++j) {
 #define LOOP { 	*(dest++) = *(ySrc++);			\
-				*(dest++) = *uSrc;				\
 				*(dest++) = *vSrc;				\
+				*(dest++) = *uSrc;				\
 				*(dest++) = *(ySrc++);			\
-				*(dest++) = *(uSrc++);			\
-				*(dest++) = *(vSrc++);  }
+				*(dest++) = *(vSrc++);			\
+				*(dest++) = *(uSrc++);  }
 			LOOP;
 			LOOP;
 			LOOP;

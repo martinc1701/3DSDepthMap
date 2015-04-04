@@ -38,6 +38,7 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/calib3d.hpp>
 
+#define USE_STEREO_SGBM 1
 
 //
 // Hard-coded constants (for now ...)
@@ -45,13 +46,17 @@
 
 // Block size for matching. Larger is slower, and tends to be less accurate, but
 // can find matches on less textured surfaces. MUST be odd.
-static const int MATCHER_BLOCK_SIZE = 21; 
+#if !USE_STEREO_SGBM
+static const int MATCHER_BLOCK_SIZE = 21; // 21 
+#else
+static const int MATCHER_BLOCK_SIZE = 7;
+#endif
 
 // The 3DS cameras are a fair distance apart, so we need a suitable minimum distance
 // for the block matching. 48 seems good for objects that are at least 2ft from the
 // cameras. If this is too large, then close objects won't be detected; too small and
 // far objects won't be detected.
-static const int MIN_DISPARITY = 45;
+static const int MIN_DISPARITY = 45; // 45
 
 // Edge detection thresholds for "deflating" the depth values. We want the colour
 // threshold to be low, and the depth threshold to be high.
@@ -69,10 +74,14 @@ static const double N3DSXL_FOCAL_LEN = 565.0;
 // case. This value is in metres.
 static const double N3DSXL_CONVERGENCE = 0.25;
 
-
+#if !USE_STEREO_SGBM
 static cv::Ptr<cv::StereoBM> matcher;
+#else
+static cv::Ptr<cv::StereoSGBM> matcher;
+#endif
 
 static void initMatcher() {
+#if !USE_STEREO_SGBM
 	matcher = cv::StereoBM::create();
 
 	// These settings were infered through trial-and-error by using a simple tool 
@@ -92,6 +101,17 @@ static void initMatcher() {
 	// This filtering step removes erratic depth values (i.e. salt-and-pepper noise).
 	// It's better to remove too much than have inaccurate values ...
 	matcher->setTextureThreshold(3000);
+#else
+	matcher = cv::StereoSGBM::create(MIN_DISPARITY, 32, MATCHER_BLOCK_SIZE,
+									 8 * MATCHER_BLOCK_SIZE*MATCHER_BLOCK_SIZE,
+									 32 * MATCHER_BLOCK_SIZE*MATCHER_BLOCK_SIZE);
+	// The input images are NOISY - filter as much as we can.
+	matcher->setPreFilterCap(1);
+	matcher->setUniquenessRatio(5);
+	matcher->setSpeckleWindowSize(250);
+	matcher->setSpeckleRange(1);
+	//matcher->setMode(true);
+#endif
 }
 
 
@@ -102,13 +122,14 @@ static cv::Mat computeDepth(const cv::Mat& left, const cv::Mat& right) {
 	// For whatever reason, compute() gives us signed values ... likely a bug ...
 	disparity.convertTo(disparity, CV_16UC1);
 
-	//
-	// Deal with the "ballooning" effect.
-	//
-
 	// The minimum value corresponds to the "UNKNOWN" measurement.
 	double dispUnknown, dispMaxi;
 	cv::minMaxIdx(disparity, &dispUnknown, &dispMaxi);
+
+#if !USE_STEREO_SGBM
+	//
+	// Deal with the "ballooning" effect.
+	//
 
 	cv::Mat colourEdges, disparityEdges;
 
@@ -151,7 +172,8 @@ static cv::Mat computeDepth(const cv::Mat& left, const cv::Mat& right) {
 	// Since we only do the above loop in 1 dimension, we may have thin lines due to noise.
 	// Remove these with a median filter (we do NOT want averages here ...)
 	cv::medianBlur(disparity, disparity, 5);
-
+#endif
+	
 	// Convert the disparity to a Kinect-style depth image. That is, we compute the depth to mm
 	// precision, then convert to some strange fixed-point format (reference: SiftFu.m:383).
 	for (int i = 0; i < disparity.rows; ++i) {
@@ -165,8 +187,11 @@ static cv::Mat computeDepth(const cv::Mat& left, const cv::Mat& right) {
 				double depth = 1000.0 * abs(
 					N3DSXL_CAM_DIST / ((N3DSXL_CAM_DIST / N3DSXL_CONVERGENCE) - (disp / N3DSXL_FOCAL_LEN)));
 				//printf("%f\n", depth);
-				ushort d = depth;
-				row[j] = (d << 3) | (d >> 13); //???
+				if (depth < 65535)
+					row[j] = (ushort)depth;
+				else
+					row[j] = 0;
+				//row[j] = (d << 3) | (d >> 13); //???
 			}
 		}
 	}
@@ -238,14 +263,11 @@ int main(int argc, char **argv) {
 		// Load the input video.
 
 		N3DSVideo *video = new N3DSVideo(inputPath.c_str(), true, true);
+		N3DSVideo *rgbVideo = new N3DSVideo(inputPath.c_str(), false, true);
 		makeDirectory(outputPath.c_str());
 		makeDirectory((outputPath + "/raw").c_str());
 		makeDirectory((outputPath + "/image").c_str());
 		makeDirectory((outputPath + "/depth").c_str());
-
-		std::ofstream intrinsics(outputPath + "/intrinsics.txt");
-		intrinsics << N3DSXL_FOCAL_LEN << " 0 320\n0 " << N3DSXL_FOCAL_LEN << " 240\n0 0 1\n";
-		intrinsics.close();
 
 		printf("Processing video ...\n");
 		
@@ -261,7 +283,7 @@ int main(int argc, char **argv) {
 		int timeMs = 0;
 		int dMaxi = 1;
 
-		while (video->processStep()) {
+		while (video->processStep() && rgbVideo->processStep()) {
 			if (!video->hasNewStereoImage()) continue;
 
 			std::ostringstream filename;
@@ -280,8 +302,8 @@ int main(int argc, char **argv) {
 			timeMs += 50; // 3DS video is 20fps
 
 			if (saveRaw) {
-				cv::imwrite(rawLFile.str(), video->leftImage());
-				cv::imwrite(rawRFile.str(), video->rightImage());
+				cv::imwrite(rawLFile.str(), rgbVideo->leftImage());
+				cv::imwrite(rawRFile.str(), rgbVideo->rightImage());
 			}
 
 			if (noDepth) continue;
@@ -298,10 +320,17 @@ int main(int argc, char **argv) {
 							640.0 / imScale, depth.rows);
 			cv::Mat rescaledDepth, rescaledLeft;
 			cv::resize(depth(region), rescaledDepth, cv::Size(640, 480));
-			cv::resize(video->leftImage()(region), rescaledLeft, cv::Size(640, 480));
+			cv::resize(rgbVideo->leftImage()(region), rescaledLeft, cv::Size(640, 480));
 			
 			cv::imwrite(colourFile.str(), rescaledLeft);
 			cv::imwrite(depthFile.str(), rescaledDepth);
+
+			if (frame == 1) {
+				std::ofstream intrinsics(outputPath + "/intrinsics.txt");
+				intrinsics << N3DSXL_FOCAL_LEN / imScale << " 0 320\n0 " 
+				           << N3DSXL_FOCAL_LEN / imScale << " 240\n0 0 1\n";
+				intrinsics.close();
+			}
 
 			if (!quiet) {
 				// Since the depth image is likely to be very dark, rescale it before showing it.
